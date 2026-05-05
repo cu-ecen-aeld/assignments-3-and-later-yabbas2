@@ -1,4 +1,9 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <stdio.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +21,8 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+    int ret = system(cmd);
+    return (ret == 0);
 }
 
 /**
@@ -45,10 +50,8 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
+    va_end(args);
 /*
  * TODO:
  *   Execute a system command by calling fork, execv(),
@@ -58,8 +61,27 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    pid_t pid = fork();
 
-    va_end(args);
+    if (pid == 0) { // child process
+        execv(command[0], command);
+        abort();
+    }
+
+    if (pid == -1) { // failed to create child process
+        return false;
+    }
+
+    int wstatus;
+    (void)waitpid(pid, &wstatus, 0);
+
+    if (WIFEXITED(wstatus)) {
+        if (WEXITSTATUS(wstatus) != 0) {
+            return false;
+        }
+    } else {
+        return false;
+    }
 
     return true;
 }
@@ -80,11 +102,8 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
-
+    va_end(args);
 /*
  * TODO
  *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
@@ -93,7 +112,34 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *
 */
 
-    va_end(args);
+    int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (fd == -1) {
+        return false;
+    }
+
+    pid_t pid = fork();
+
+    if (pid == 0) { // child process
+        if (dup2(fd, 1) != -1) {
+            execv(command[0], command);
+        }
+        abort();
+    }
+
+    if (pid == -1) { // failed to create child process
+        return false;
+    }
+
+    int wstatus;
+    (void)waitpid(pid, &wstatus, 0);
+
+    if (WIFEXITED(wstatus)) {
+        if (WEXITSTATUS(wstatus) != 0) {
+            return false;
+        }
+    } else {
+        return false;
+    }
 
     return true;
 }
