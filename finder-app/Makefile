@@ -1,7 +1,7 @@
 CROSS_COMPILE ?=
 CC = $(CROSS_COMPILE)gcc
 
-writer:
+all:
 	$(CC) writer.c -o writer
 
 clean:
