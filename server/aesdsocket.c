@@ -1,12 +1,15 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -14,12 +17,143 @@
 #define LISTEN_BACKLOG 10
 #define TMP_FILE_PATH "/var/tmp/aesdsocketdata"
 #define RECV_DATA_MAX_LEN 1024
+#define TIMESTAMP_PREFIX_LEN 10
+
+struct entry {
+    pthread_t thread;
+    SLIST_ENTRY(entry) entries;
+};
+
+SLIST_HEAD(slisthead, entry);
 
 static bool running = true;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static int f_fd = -1;
+static struct entry *last_entry = NULL;
 
 static void signal_handler(int signum) {
     printf("Received signal %d\n", signum);
     running = false;
+}
+
+static void *handle_thread(void *arg) {
+    int client_fd = *(int *)arg;
+    ssize_t bytes_read;
+    bool complete_packet = false;
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char client_ip[INET_ADDRSTRLEN] = {0};
+    pthread_t tid = pthread_self();
+
+    if (getpeername(client_fd, (struct sockaddr *)&client_addr, &client_addr_len) == 0) {
+        if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip)) != NULL) {
+            syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+            printf("aesdsocket: thread %ld accepted connection from %s\n", (unsigned long)tid, client_ip);
+        }
+    }
+
+    char *buffer = malloc(RECV_DATA_MAX_LEN);
+    if (buffer == NULL) {
+        perror("malloc");
+        free(arg);
+        return NULL;
+    }
+
+    do {
+        bytes_read = recv(client_fd, buffer, RECV_DATA_MAX_LEN, 0);
+        if (bytes_read == 0) {
+            break;
+        } else if (bytes_read < 0) {
+            perror("recv");
+            break;
+        } else {
+            printf("aesdsocket: thread %ld received %d bytes\n", (unsigned long)tid, (int)bytes_read);
+        }
+
+        (void)pthread_mutex_lock(&mutex);
+        ssize_t f_bytes_written = write(f_fd, buffer, bytes_read);
+        (void)pthread_mutex_unlock(&mutex);
+        if (f_bytes_written < 0) {
+            perror("write");
+            break;
+        }
+
+        if (buffer[bytes_read - 1] == '\n') {
+            complete_packet = true;
+        }
+    } while (!complete_packet);
+
+    if (!complete_packet) {
+        syslog(LOG_INFO, "Connection closed from %s", client_ip);
+        printf("aesdsocket: thread %ld closed connection\n", (unsigned long)tid);
+        close(client_fd);
+        free(buffer);
+        free(arg);
+        return NULL;
+    }
+
+    ssize_t total_bytes_read = 0;
+    bool complete_file = false;
+    do {
+        (void)pthread_mutex_lock(&mutex);
+        if (lseek(f_fd, total_bytes_read, SEEK_SET) < 0) {
+            perror("lseek");
+            (void)pthread_mutex_unlock(&mutex);
+            break;
+        }
+        ssize_t f_bytes_read = read(f_fd, buffer, RECV_DATA_MAX_LEN);
+        (void)pthread_mutex_unlock(&mutex);
+        if (f_bytes_read < 0) {
+            perror("read");
+            break;
+        }
+
+        total_bytes_read += f_bytes_read;
+
+        printf("aesdsocket: thread %ld sending %d bytes\n", (unsigned long)tid, (int)f_bytes_read);
+        ssize_t bytes_written = send(client_fd, buffer, f_bytes_read, 0);
+        if (bytes_written < 0) {
+            perror("send");
+            break;
+        }
+
+        if (f_bytes_read < RECV_DATA_MAX_LEN) {
+            complete_file = true;
+        }
+    } while (!complete_file);
+
+    syslog(LOG_INFO, "Connection closed from %s", client_ip);
+    printf("aesdsocket: thread %ld closed connection\n", (unsigned long)tid);
+    close(client_fd);
+    free(buffer);
+    free(arg);
+    return NULL;
+}
+
+static void itimer_handler(union sigval value) {
+    printf("Received signal %d\n", value.sival_int);
+    time_t t;
+    struct tm *tm;
+    char buffer[256] = {'t', 'i', 'm', 'e', 's', 't', 'a', 'm', 'p', ':'};
+    int bytes_read;
+
+    t = time(NULL);
+    tm = localtime(&t);
+    bytes_read = strftime(&buffer[TIMESTAMP_PREFIX_LEN], (sizeof(buffer) - TIMESTAMP_PREFIX_LEN), "%Y-%m-%d %H:%M:%S", tm);
+    if (bytes_read == 0) {
+        perror("strftime");
+        return;
+    }
+    bytes_read += TIMESTAMP_PREFIX_LEN;
+    buffer[bytes_read] = '\n';
+    bytes_read++;
+
+    (void)pthread_mutex_lock(&mutex);
+    ssize_t f_bytes_written = write(f_fd, buffer, bytes_read);
+    (void)pthread_mutex_unlock(&mutex);
+    if (f_bytes_written < 0) {
+        perror("write");
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -99,104 +233,77 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    char *buffer = malloc(RECV_DATA_MAX_LEN);
-    if (buffer == NULL) {
-        perror("malloc");
+    f_fd = open(TMP_FILE_PATH, O_APPEND | O_CREAT | O_RDWR, 0644);
+    if (f_fd < 0) {
+        perror("open");
         return -1;
     }
 
-    int f_fd = open(TMP_FILE_PATH, O_APPEND | O_CREAT | O_RDWR, 0644);
-    if (f_fd < 0) {
-        perror("open");
+    timer_t timerid;
+    struct itimerspec itimer = {
+        .it_interval = {.tv_sec = 10, .tv_nsec = 0},
+        .it_value = {.tv_sec = 10, .tv_nsec = 0},
+    };
+    struct sigevent sev = {
+        .sigev_notify = SIGEV_THREAD,
+        ._sigev_un._sigev_thread._function = itimer_handler,
+        .sigev_value.sival_ptr = &timerid,
+    };
+    if (timer_create(CLOCK_REALTIME, &sev, &timerid) < 0) {
+        perror("timer_create");
+        return -1;
+    }
+    if (timer_settime(timerid, 0, &itimer, NULL) < 0) {
+        perror("timer_settime");
         return -1;
     }
 
     printf("aesdsocket: listening on port 9000\n");
     openlog("aesdsocket", 0, LOG_USER);
 
+    struct slisthead head;
+    SLIST_INIT(&head);
+
     while (running) {
-        struct sockaddr client_addr;
-        socklen_t client_addr_len = sizeof(struct sockaddr);
-        int client_fd = accept(socket_fd, &client_addr, &client_addr_len);
+        int client_fd = accept(socket_fd, NULL, NULL);
         if (client_fd < 0) {
             perror("accept");
             close(client_fd);
             continue;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        if (inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr, client_ip, sizeof(client_ip)) != NULL) {
-            syslog(LOG_INFO, "Accepted connection from %s", client_ip);
-        }
-        printf("aesdsocket: accepted connection from %s\n", client_ip);
-
-        ssize_t bytes_read;
-        bool complete_packet = false;
-        do {
-            bytes_read = recv(client_fd, buffer, RECV_DATA_MAX_LEN, 0);
-            if (bytes_read == 0) {
-                break;
-            } else if (bytes_read < 0) {
-                perror("recv");
-                break;
+        pthread_t thread;
+        int *client_fd_ptr = malloc(sizeof(int));
+        *client_fd_ptr = client_fd;
+        int ret = pthread_create(&thread, NULL, handle_thread, client_fd_ptr);
+        if (ret == 0) {
+            struct entry *entry = malloc(sizeof(struct entry));
+            entry->thread = thread;
+            if (SLIST_EMPTY(&head)) {
+                SLIST_INSERT_HEAD(&head, entry, entries);
             } else {
-                printf("aesdsocket: received %d bytes\n", (int)bytes_read);
+                SLIST_INSERT_AFTER(last_entry, entry, entries);
             }
-
-            ssize_t f_bytes_written = write(f_fd, buffer, bytes_read);
-            if (f_bytes_written < 0) {
-                perror("write");
-                break;
-            }
-
-            if (buffer[bytes_read - 1] == '\n') {
-                complete_packet = true;
-            }
-        } while (!complete_packet && running);
-
-        if (!complete_packet) {
-            syslog(LOG_INFO, "Connection closed from %s", client_ip);
-            close(client_fd);
-            continue;
+            last_entry = entry;
         }
-
-        ssize_t total_bytes_read = 0;
-        bool complete_file = false;
-        do {
-            if (lseek(f_fd, total_bytes_read, SEEK_SET) < 0) {
-                perror("lseek");
-                break;
-            }
-
-            ssize_t f_bytes_read = read(f_fd, buffer, RECV_DATA_MAX_LEN);
-            if (f_bytes_read < 0) {
-                perror("read");
-                break;
-            }
-
-            if (f_bytes_read < RECV_DATA_MAX_LEN) {
-                complete_file = true;
-            }
-
-            total_bytes_read += f_bytes_read;
-
-            printf("aesdsocket: sending %d bytes\n", (int)f_bytes_read);
-            ssize_t bytes_written = send(client_fd, buffer, f_bytes_read, 0);
-            if (bytes_written < 0) {
-                perror("send");
-                break;
-            }
-        } while (!complete_file && running);
-
-        syslog(LOG_INFO, "Connection closed from %s", client_ip);
-        close(client_fd);
     }
 
     printf("aesdsocket: exiting\n");
+
+    // clean up
+    struct entry *entry;
+    SLIST_FOREACH(entry, &head, entries) {
+        pthread_join(entry->thread, NULL);
+        printf("aesdsocket: thread %ld joined\n", (unsigned long)entry->thread);
+    }
+    while (!SLIST_EMPTY(&head)) {
+        entry = SLIST_FIRST(&head);
+        SLIST_REMOVE_HEAD(&head, entries);
+        free(entry);
+    }
     closelog();
     close(socket_fd);
     close(f_fd);
-    free(buffer);
     if (unlink(TMP_FILE_PATH) < 0) {
         perror("unlink");
     }
