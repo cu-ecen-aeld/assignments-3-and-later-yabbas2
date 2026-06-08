@@ -177,7 +177,6 @@ static int __init aesd_init_module(void)
 	goto exit;
 
 free_class:
-	class_unregister(aesd_class);
 	class_destroy(aesd_class);
 free_chrdev:
 	unregister_chrdev(aesd_major, DRV_NAME);
@@ -196,7 +195,6 @@ static void __exit aesd_cleanup_module(void)
 
 	mutex_destroy(&aesd_dev.mutex);
 	device_destroy(aesd_class, MKDEV(aesd_major, aesd_minor));
-	class_unregister(aesd_class);
 	class_destroy(aesd_class);
 	unregister_chrdev(aesd_major, DRV_NAME);
 }
