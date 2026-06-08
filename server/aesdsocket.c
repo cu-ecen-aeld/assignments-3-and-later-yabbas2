@@ -14,10 +14,19 @@
 #include <syslog.h>
 #include <unistd.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 #define LISTEN_BACKLOG 10
-#define TMP_FILE_PATH "/var/tmp/aesdsocketdata"
 #define RECV_DATA_MAX_LEN 1024
 #define TIMESTAMP_PREFIX_LEN 10
+
+#if USE_AESD_CHAR_DEVICE
+#define OUTPUT_PATH "/dev/aesdchar"
+#else
+#define OUTPUT_PATH "/var/tmp/aesdsocketdata"
+#endif
 
 struct entry {
     pthread_t thread;
@@ -93,7 +102,6 @@ static void *handle_thread(void *arg) {
     }
 
     ssize_t total_bytes_read = 0;
-    bool complete_file = false;
     do {
         (void)pthread_mutex_lock(&mutex);
         if (lseek(f_fd, total_bytes_read, SEEK_SET) < 0) {
@@ -108,6 +116,10 @@ static void *handle_thread(void *arg) {
             break;
         }
 
+        if (f_bytes_read == 0) {
+            break;
+        }
+
         total_bytes_read += f_bytes_read;
 
         printf("aesdsocket: thread %ld sending %d bytes\n", (unsigned long)tid, (int)f_bytes_read);
@@ -117,10 +129,7 @@ static void *handle_thread(void *arg) {
             break;
         }
 
-        if (f_bytes_read < RECV_DATA_MAX_LEN) {
-            complete_file = true;
-        }
-    } while (!complete_file);
+    } while (true);
 
     syslog(LOG_INFO, "Connection closed from %s", client_ip);
     printf("aesdsocket: thread %ld closed connection\n", (unsigned long)tid);
@@ -130,6 +139,7 @@ static void *handle_thread(void *arg) {
     return NULL;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 static void itimer_handler(union sigval value) {
     printf("Received signal %d\n", value.sival_int);
     time_t t;
@@ -155,6 +165,7 @@ static void itimer_handler(union sigval value) {
         perror("write");
     }
 }
+#endif
 
 int main(int argc, char *argv[]) {
     struct sigaction sa;
@@ -233,12 +244,13 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    f_fd = open(TMP_FILE_PATH, O_APPEND | O_CREAT | O_RDWR, 0644);
+    f_fd = open(OUTPUT_PATH, O_APPEND | O_CREAT | O_RDWR, 0644);
     if (f_fd < 0) {
         perror("open");
         return -1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     timer_t timerid;
     struct itimerspec itimer = {
         .it_interval = {.tv_sec = 10, .tv_nsec = 0},
@@ -257,6 +269,7 @@ int main(int argc, char *argv[]) {
         perror("timer_settime");
         return -1;
     }
+#endif
 
     printf("aesdsocket: listening on port 9000\n");
     openlog("aesdsocket", 0, LOG_USER);
@@ -304,9 +317,11 @@ int main(int argc, char *argv[]) {
     closelog();
     close(socket_fd);
     close(f_fd);
-    if (unlink(TMP_FILE_PATH) < 0) {
+#if !USE_AESD_CHAR_DEVICE
+    if (unlink(OUTPUT_PATH) < 0) {
         perror("unlink");
     }
+#endif
 
     return 0;
 }
