@@ -58,7 +58,7 @@ extern void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer,
 
 extern struct aesd_buffer_entry *aesd_circular_buffer_pop_entry(struct aesd_circular_buffer *buffer);
 
-extern struct aesd_buffer_entry *aesd_circular_buffer_read_entry(struct aesd_circular_buffer *buffer);
+extern size_t aesd_circular_buffer_get_size(struct aesd_circular_buffer *buffer);
 
 extern bool aesd_circular_buffer_is_full(struct aesd_circular_buffer *buffer);
 

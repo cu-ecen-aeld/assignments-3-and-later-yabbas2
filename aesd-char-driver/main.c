@@ -23,6 +23,7 @@
 #include <linux/minmax.h>
 #include "aesd-circular-buffer.h"
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 
 #define DRV_NAME "aesdchar"
 
@@ -129,14 +130,68 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t coun
 	return retval;
 }
 
-struct file_operations aesd_fops = {
-	.owner = THIS_MODULE,
-	.read = aesd_read,
-	.write = aesd_write,
-	.open = aesd_open,
-	.release = aesd_release,
-	.llseek = default_llseek,
-};
+static loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+	loff_t size;
+	int ret;
+
+	PDEBUG("llseek");
+
+	ret = mutex_lock_interruptible(&aesd_dev.mutex);
+	if (ret != 0) {
+		return ret;
+	}
+	size = aesd_circular_buffer_get_size(&aesd_dev.circ_buf);
+	mutex_unlock(&aesd_dev.mutex);
+
+	return fixed_size_llseek(filp, offset, whence, size);
+}
+
+static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct aesd_seekto *seekto;
+	struct aesd_buffer_entry *entry;
+	uint8_t out;
+	size_t offset = 0;
+
+	PDEBUG("ioctl");
+
+	if (cmd != AESDCHAR_IOCSEEKTO) {
+		return -EINVAL;
+	}
+
+	seekto = (struct aesd_seekto *)arg;
+	if (seekto->write_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+		return -EINVAL;
+	}
+	out = (aesd_dev.circ_buf.out_offs + seekto->write_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+	entry = &aesd_dev.circ_buf.entry[out];
+	if (entry->size == 0) {
+		return -EINVAL;
+	}
+
+	if (seekto->write_cmd_offset >= entry->size) {
+		return -EINVAL;
+	}
+
+	for (uint8_t i = aesd_dev.circ_buf.out_offs; i != out; i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+		struct aesd_buffer_entry *entry = &aesd_dev.circ_buf.entry[i];
+		offset += entry->size;
+	}
+	offset += seekto->write_cmd_offset;
+
+	filp->f_pos = offset; // seek
+
+	return 0;
+}
+
+struct file_operations aesd_fops = { .owner = THIS_MODULE,
+				     .read = aesd_read,
+				     .write = aesd_write,
+				     .open = aesd_open,
+				     .release = aesd_release,
+				     .llseek = aesd_llseek,
+				     .unlocked_ioctl = aesd_ioctl };
 
 static int aesd_dev_uevent(struct device *dev, struct kobj_uevent_env *env)
 {

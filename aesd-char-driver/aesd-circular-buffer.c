@@ -70,10 +70,24 @@ struct aesd_buffer_entry *aesd_circular_buffer_pop_entry(struct aesd_circular_bu
 	return entry;
 }
 
-struct aesd_buffer_entry *aesd_circular_buffer_read_entry(struct aesd_circular_buffer *buffer)
+size_t aesd_circular_buffer_get_size(struct aesd_circular_buffer *buffer)
 {
-	struct aesd_buffer_entry *entry = &buffer->entry[buffer->out_offs];
-	return entry;
+    uint8_t in = buffer->in_offs, out = buffer->out_offs;
+    size_t size = 0;
+
+	if (in == out) { // either empty or full
+		if (!buffer->full) {
+			return 0;
+		}
+	}
+
+    do {
+        struct aesd_buffer_entry *entry = &buffer->entry[out];
+        size += entry->size;
+        out = (out + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } while (in != out);
+
+    return size;
 }
 
 bool aesd_circular_buffer_is_full(struct aesd_circular_buffer *buffer)

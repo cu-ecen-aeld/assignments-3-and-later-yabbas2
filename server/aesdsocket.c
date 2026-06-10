@@ -9,10 +9,11 @@
 #include <string.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <syslog.h>
 #include <unistd.h>
+#include "aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -24,7 +25,10 @@
 
 #if USE_AESD_CHAR_DEVICE
 #define OUTPUT_PATH "/dev/aesdchar"
+#define CMD_PREFIX "AESDCHAR_IOCSEEKTO:"
+#define CMD_PREFIX_LEN 19
 #else
+#include <time.h>
 #define OUTPUT_PATH "/var/tmp/aesdsocketdata"
 #endif
 
@@ -46,6 +50,35 @@ static void signal_handler(int signum)
 	running = false;
 }
 
+#if USE_AESD_CHAR_DEVICE
+static bool is_cmd(const char *str, ssize_t len)
+{
+	if (len < CMD_PREFIX_LEN) {
+		return false;
+	}
+
+	return memcmp(str, CMD_PREFIX, CMD_PREFIX_LEN) == 0;
+}
+
+static bool parse_cmd_offsets(const char *str, ssize_t len, uint32_t *x_offset, uint32_t *y_offset)
+{
+	// calc x offset
+	const char *start_pos = str;
+	char *end_pos;
+	*x_offset = strtoll(start_pos, &end_pos, 10);
+	if (end_pos == start_pos) {
+		return false;
+	}
+	// calc y offset
+	start_pos = end_pos + 1;
+	*y_offset = strtoll(start_pos, &end_pos, 10);
+	if (end_pos == start_pos) {
+		return false;
+	}
+	return true;
+}
+#endif
+
 static void *handle_thread(void *arg)
 {
 	int client_fd = *(int *)arg;
@@ -55,6 +88,10 @@ static void *handle_thread(void *arg)
 	socklen_t client_addr_len = sizeof(client_addr);
 	char client_ip[INET_ADDRSTRLEN] = { 0 };
 	pthread_t tid = pthread_self();
+#if USE_AESD_CHAR_DEVICE
+	struct aesd_seekto seekto;
+	bool use_ioctl = false;
+#endif
 
 	if (getpeername(client_fd, (struct sockaddr *)&client_addr, &client_addr_len) == 0) {
 		if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip)) != NULL) {
@@ -81,19 +118,32 @@ static void *handle_thread(void *arg)
 			printf("aesdsocket: thread %ld received %d bytes\n", (unsigned long)tid, (int)bytes_read);
 		}
 
-		(void)pthread_mutex_lock(&mutex);
-		f_fd = open(OUTPUT_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (f_fd < 0) {
-            perror("open");
-            (void)pthread_mutex_unlock(&mutex);
-            break;
-        }
-		ssize_t f_bytes_written = write(f_fd, buffer, bytes_read);
-		close(f_fd);
-		(void)pthread_mutex_unlock(&mutex);
-		if (f_bytes_written < 0) {
-			perror("write");
-			break;
+#if USE_AESD_CHAR_DEVICE
+		if (is_cmd(buffer, bytes_read)) {
+			if (!parse_cmd_offsets(buffer + CMD_PREFIX_LEN, bytes_read - CMD_PREFIX_LEN, &seekto.write_cmd,
+					       &seekto.write_cmd_offset)) {
+				break;
+			}
+			printf("aesdsocket: thread %ld received cmd %d %d\n", (unsigned long)tid, seekto.write_cmd,
+			       seekto.write_cmd_offset);
+			use_ioctl = true;
+		} else
+#endif
+		{
+			(void)pthread_mutex_lock(&mutex);
+			f_fd = open(OUTPUT_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+			if (f_fd < 0) {
+				perror("open");
+				(void)pthread_mutex_unlock(&mutex);
+				break;
+			}
+			ssize_t f_bytes_written = write(f_fd, buffer, bytes_read);
+			close(f_fd);
+			(void)pthread_mutex_unlock(&mutex);
+			if (f_bytes_written < 0) {
+				perror("write");
+				break;
+			}
 		}
 
 		if (buffer[bytes_read - 1] == '\n') {
@@ -114,16 +164,30 @@ static void *handle_thread(void *arg)
 	do {
 		(void)pthread_mutex_lock(&mutex);
 		f_fd = open(OUTPUT_PATH, O_RDONLY, 0666);
-        if (f_fd < 0) {
-            perror("open");
-            (void)pthread_mutex_unlock(&mutex);
-            break;
-        }
-		if (lseek(f_fd, total_bytes_read, SEEK_SET) < 0) {
-			perror("lseek");
-			close(f_fd);
+		if (f_fd < 0) {
+			perror("open");
 			(void)pthread_mutex_unlock(&mutex);
 			break;
+		}
+#if USE_AESD_CHAR_DEVICE
+		if (use_ioctl) {
+            use_ioctl = false;
+			if (ioctl(f_fd, AESDCHAR_IOCSEEKTO, (void *)&seekto) < 0) {
+				perror("ioctl");
+				close(f_fd);
+				(void)pthread_mutex_unlock(&mutex);
+				break;
+			}
+            total_bytes_read += lseek(f_fd, 0, SEEK_CUR);
+		} else
+#endif
+		{
+			if (lseek(f_fd, total_bytes_read, SEEK_SET) < 0) {
+				perror("lseek");
+				close(f_fd);
+				(void)pthread_mutex_unlock(&mutex);
+				break;
+			}
 		}
 		ssize_t f_bytes_read = read(f_fd, buffer, RECV_DATA_MAX_LEN);
 		close(f_fd);
